@@ -56,6 +56,7 @@ dependencies {
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-guava:1.6.0")
     implementation("androidx.work:work-runtime-ktx:$work_version")
+    implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("androidx.health.connect:connect-client:1.1.0-alpha07")
     implementation("com.google.code.gson:gson:2.10.1")
     implementation(libs.androidx.core.ktx)
