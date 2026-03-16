@@ -14,24 +14,13 @@ import androidx.health.connect.client.records.HeartRateRecord
 import androidx.health.connect.client.records.SleepSessionRecord
 import androidx.health.connect.client.records.StepsRecord
 import androidx.health.connect.client.records.TotalCaloriesBurnedRecord
+import androidx.health.connect.client.records.WeightRecord
 import androidx.health.connect.client.request.AggregateRequest
 import androidx.health.connect.client.time.TimeRangeFilter
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import com.google.gson.Gson
-import io.ktor.client.HttpClient
-import io.ktor.client.engine.android.Android
-import io.ktor.client.request.post
-import io.ktor.client.request.setBody
-import io.ktor.http.ContentType
-import io.ktor.http.contentType
-import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.runBlocking
-import java.time.LocalDate
-import java.util.TimeZone
-
-val httpClient = HttpClient(Android)
+import java.time.Instant
 
 val requiredHealthConnectPermissions = setOf(
     HealthPermission.getReadPermission(StepsRecord::class),
@@ -39,10 +28,12 @@ val requiredHealthConnectPermissions = setOf(
     HealthPermission.getReadPermission(ActiveCaloriesBurnedRecord::class),
     HealthPermission.getReadPermission(TotalCaloriesBurnedRecord::class),
     HealthPermission.getReadPermission(HeartRateRecord::class),
+    HealthPermission.getReadPermission(WeightRecord::class),
 )
 
 class DataExporterScheduleWorker(
-    appContext: Context, workerParams: WorkerParameters
+    appContext: Context,
+    workerParams: WorkerParameters
 ) : CoroutineWorker(appContext, workerParams) {
     private val notificationManager = applicationContext.getSystemService<NotificationManager>()!!
     private val healthConnect = HealthConnectClient.getOrCreate(applicationContext)
@@ -78,41 +69,39 @@ class DataExporterScheduleWorker(
     override suspend fun doWork(): Result {
         val notificationChannel = createNotificationChannel()
 
-        Log.d("DataExporterWorker", "Checking exports prerequisites")
         val isGranted = isHealthConnectPermissionGranted(healthConnect)
-
         if (!isGranted) {
             Log.d("DataExporterWorker", "Health Connect permissions not granted")
             return Result.failure()
         }
-        Log.d("DataExporterWorker", "✅ Health Connect permissions granted")
 
-        val exportDestination: String? =
-            applicationContext.dataStore.data.map { it[EXPORT_DESTINATION_URI] }.first()
-        if (exportDestination == null) {
-            Log.d("DataExporterWorker", "Export destination not set")
+        val prefs = applicationContext.exportPrefs()
+        val exportFolderUri = prefs.getString(EXPORT_FOLDER_URI_KEY, null)
+        if (exportFolderUri == null) {
+            Log.d("DataExporterWorker", "Export folder not set")
             return Result.failure()
         }
-        Log.d("DataExporterWorker", "✅ Export destination set")
 
         val foregroundNotification =
             NotificationCompat.Builder(applicationContext, notificationChannel.id)
                 .setContentTitle("Exporting data")
-                .setContentText("Exporting Health Connect data to the cloud")
-                .setSmallIcon(R.drawable.ic_launcher_foreground).setOngoing(true)
+                .setContentText("Exporting Health Connect data to local storage")
+                .setSmallIcon(R.drawable.ic_launcher_foreground)
+                .setOngoing(true)
                 .build()
 
         notificationManager.notify(1, foregroundNotification)
 
-        // TODO: Lock this to a specific timezone
-        val zoneId = TimeZone.getDefault().toZoneId()
-        // Start of day yesterday
-        val startOfDay = LocalDate.now(zoneId).atStartOfDay(zoneId).minusDays(1).toInstant()
-        val endOfDay = LocalDate.now(zoneId).atStartOfDay(zoneId).toInstant().minusMillis(1)
+        val exportTo = Instant.now()
+        val lastExportTimestamp = prefs.getLong(LAST_EXPORT_TIMESTAMP_KEY, -1)
+        val exportFrom = if (lastExportTimestamp > 0) {
+            Instant.ofEpochMilli(lastExportTimestamp)
+        } else {
+            Instant.EPOCH
+        }
 
-        Log.d("DataExporterWorker", "Fetching health data")
-        val healthDataAggregate = runBlocking {
-            healthConnect.aggregate(
+        return try {
+            val healthDataAggregate = healthConnect.aggregate(
                 AggregateRequest(
                     metrics = setOf(
                         StepsRecord.COUNT_TOTAL,
@@ -120,39 +109,42 @@ class DataExporterScheduleWorker(
                         TotalCaloriesBurnedRecord.ENERGY_TOTAL,
                         SleepSessionRecord.SLEEP_DURATION_TOTAL,
                     ),
-                    timeRangeFilter = TimeRangeFilter.Companion.between(startOfDay, endOfDay),
+                    timeRangeFilter = TimeRangeFilter.between(exportFrom, exportTo),
                 )
             )
-        }
-        Log.d("DataExporterWorker", "Raw data: ${Gson().toJson(healthDataAggregate)}")
 
-        val jsonValues = HashMap<String, Number>()
-        jsonValues["steps"] = healthDataAggregate[StepsRecord.COUNT_TOTAL] ?: 0
-        jsonValues["active_calories"] =
-            healthDataAggregate[ActiveCaloriesBurnedRecord.ACTIVE_CALORIES_TOTAL]?.inKilocalories
-                ?: 0
-        jsonValues["total_calories"] =
-            healthDataAggregate[TotalCaloriesBurnedRecord.ENERGY_TOTAL]?.inKilocalories ?: 0
-        jsonValues["sleep_duration_seconds"] =
-            healthDataAggregate[SleepSessionRecord.SLEEP_DURATION_TOTAL]?.seconds ?: 0
-        val json = Gson().toJson(mapOf("time" to startOfDay.toEpochMilli(), "data" to jsonValues))
-        Log.d("DataExporterWorker", "Data: $json")
+            val jsonValues = HashMap<String, Number>()
+            jsonValues["steps"] = healthDataAggregate[StepsRecord.COUNT_TOTAL] ?: 0
+            jsonValues["active_calories"] =
+                healthDataAggregate[ActiveCaloriesBurnedRecord.ACTIVE_CALORIES_TOTAL]?.inKilocalories
+                    ?: 0
+            jsonValues["total_calories"] =
+                healthDataAggregate[TotalCaloriesBurnedRecord.ENERGY_TOTAL]?.inKilocalories ?: 0
+            jsonValues["sleep_duration_seconds"] =
+                healthDataAggregate[SleepSessionRecord.SLEEP_DURATION_TOTAL]?.seconds ?: 0
 
-        try {
-            Log.d("DataExporterWorker", "Exporting data to $exportDestination")
-            httpClient.post("https://$exportDestination") {
-                contentType(ContentType.Application.Json)
-                setBody(json)
-            }
-        } catch (e: Exception) {
-            Log.e("DataExporterWorker", "Failed to export data", e)
+            val json = Gson().toJson(
+                mapOf(
+                    "from" to exportFrom.toEpochMilli(),
+                    "to" to exportTo.toEpochMilli(),
+                    "data" to jsonValues,
+                )
+            )
+            val fileName = buildExportFilename(exportFrom, exportTo)
+            val didWrite = writeExportJsonToFolder(applicationContext, exportFolderUri, fileName, json)
 
             notificationManager.cancel(1)
-            notificationManager.notify(1, createExceptionNotification(e))
-            return Result.failure()
-        }
+            if (!didWrite) {
+                return Result.failure()
+            }
 
-        notificationManager.cancel(1)
-        return Result.success()
+            prefs.edit().putLong(LAST_EXPORT_TIMESTAMP_KEY, exportTo.toEpochMilli()).apply()
+            Result.success()
+        } catch (e: Exception) {
+            Log.e("DataExporterWorker", "Failed to export data", e)
+            notificationManager.cancel(1)
+            notificationManager.notify(1, createExceptionNotification(e))
+            Result.failure()
+        }
     }
 }

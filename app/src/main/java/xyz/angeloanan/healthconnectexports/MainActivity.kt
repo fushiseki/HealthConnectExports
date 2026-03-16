@@ -1,60 +1,51 @@
 package xyz.angeloanan.healthconnectexports
 
-import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextField
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.input.KeyboardCapitalization
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityCompat
-import androidx.datastore.core.DataStore
-import androidx.datastore.preferences.core.Preferences
-import androidx.datastore.preferences.core.edit
-import androidx.datastore.preferences.core.stringPreferencesKey
-import androidx.datastore.preferences.preferencesDataStore
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.PermissionController
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequest
 import androidx.work.WorkManager
-import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.map
 import xyz.angeloanan.healthconnectexports.ui.components.HealthConnectProblemsBanner
 import xyz.angeloanan.healthconnectexports.ui.theme.HealthConnectExportsTheme
 import xyz.angeloanan.healthconnectexports.ui.viewmodels.ExporterBackgroundWorkViewModel
 import xyz.angeloanan.healthconnectexports.ui.viewmodels.WORK_NAME_ONCE
-
-val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
-val EXPORT_DESTINATION_URI = stringPreferencesKey("export_destination_uri")
 
 class MainActivity : ComponentActivity() {
     @OptIn(ExperimentalMaterial3Api::class)
@@ -64,25 +55,25 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             HealthConnectExportsTheme {
-                // A surface container using the 'background' color from the theme
-                Surface(
-                    modifier = Modifier.fillMaxSize(), color = colorScheme.background
-                ) {
+                Surface(modifier = Modifier.fillMaxSize(), color = colorScheme.background) {
                     Scaffold(
                         topBar = {
-                            TopAppBar(colors = TopAppBarDefaults.topAppBarColors(
-                                containerColor = colorScheme.surface,
-                                scrolledContainerColor = colorScheme.surface,
-                                navigationIconContentColor = colorScheme.onSurface,
-                                actionIconContentColor = colorScheme.onSurface,
-                                titleContentColor = colorScheme.onSurface
-                            ), title = {
-                                Text(
-                                    text = "Health Connect Exporter",
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            })
+                            TopAppBar(
+                                colors = TopAppBarDefaults.topAppBarColors(
+                                    containerColor = colorScheme.surface,
+                                    scrolledContainerColor = colorScheme.surface,
+                                    navigationIconContentColor = colorScheme.onSurface,
+                                    actionIconContentColor = colorScheme.onSurface,
+                                    titleContentColor = colorScheme.onSurface
+                                ),
+                                title = {
+                                    Text(
+                                        text = "Health Connect Exporter",
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            )
                         },
                     ) { innerPadding ->
                         Column(
@@ -90,16 +81,12 @@ class MainActivity : ComponentActivity() {
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             HealthConnectProblemsBanner()
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(16.dp)
-                            ) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                                 RequestPermissionButton()
                                 RequestHealthConnectPermissionButton()
                             }
-                            ExportDestinationInputField()
-                            Row {
-                                RunDataExportButton()
-                            }
+                            ExportFolderSection()
+                            Row { RunDataExportButton() }
                             ScheduleSwitch()
                         }
                     }
@@ -110,9 +97,45 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun ScheduleSwitch(
-    viewModel: ExporterBackgroundWorkViewModel = viewModel()
-) {
+fun ExportFolderSection() {
+    val context = LocalContext.current
+    val prefs = remember { context.exportPrefs() }
+    var folderUriString by remember { mutableStateOf(prefs.getString(EXPORT_FOLDER_URI_KEY, null)) }
+    val folderLabel = folderUriString ?: "No folder selected"
+
+    val folderPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            val takeFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            try {
+                context.contentResolver.takePersistableUriPermission(uri, takeFlags)
+                prefs.edit().putString(EXPORT_FOLDER_URI_KEY, uri.toString()).apply()
+                folderUriString = uri.toString()
+            } catch (e: SecurityException) {
+                Log.e("MainActivity", "Unable to persist URI permission", e)
+            }
+        }
+    }
+
+    LaunchedEffect(folderUriString) {
+        if (folderUriString == null) {
+            folderPickerLauncher.launch(null)
+        }
+    }
+
+    Column(modifier = Modifier.padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(text = "Export folder: $folderLabel")
+        Button(onClick = { folderPickerLauncher.launch(null) }) {
+            Text(text = "Change Export Folder")
+        }
+        val lastExport = prefs.getLong(LAST_EXPORT_TIMESTAMP_KEY, -1)
+        Text(text = if (lastExport > 0) "Last export: ${formatLastExportTime(lastExport)}" else "Last export: Never")
+    }
+}
+
+@Composable
+fun ScheduleSwitch(viewModel: ExporterBackgroundWorkViewModel = viewModel()) {
     val (checked, setChecked) = remember { mutableStateOf<Boolean?>(null) }
 
     LaunchedEffect(true) {
@@ -125,7 +148,7 @@ fun ScheduleSwitch(
             .padding(16.dp)
             .fillMaxWidth()
     ) {
-        Text("Schedule Data Export")
+        Text("Schedule Weekly Data Export")
         Switch(
             enabled = checked != null,
             checked = checked ?: false,
@@ -143,71 +166,35 @@ fun ScheduleSwitch(
 }
 
 @Composable
-fun ExportDestinationInputField() {
-    val context = LocalContext.current
-    val (fieldValue, setFieldValue) = remember { mutableStateOf<String?>(null) }
-
-    LaunchedEffect(true) {
-        setFieldValue(context.dataStore.data.map { it[EXPORT_DESTINATION_URI] }.first() ?: "")
-    }
-
-    LaunchedEffect(fieldValue) {
-        if (fieldValue == null) return@LaunchedEffect
-        context.dataStore.edit { it[EXPORT_DESTINATION_URI] = fieldValue }
-    }
-
-    TextField(enabled = fieldValue != null,
-        placeholder = { Text("Export destination URI") },
-        value = fieldValue ?: "Loading...",
-        maxLines = 1,
-        prefix = { Text("http://") },
-        keyboardOptions = KeyboardOptions(
-            KeyboardCapitalization.None,
-            autoCorrect = false,
-            keyboardType = KeyboardType.Uri,
-            imeAction = ImeAction.Go
-        ),
-        onValueChange = { setFieldValue(it) })
-}
-
-@Composable
 fun RunDataExportButton() {
     val context = LocalContext.current
     val workManager = WorkManager.getInstance(context)
 
-    Button(
-        onClick = {
-            workManager.enqueueUniqueWork(
-                WORK_NAME_ONCE,
-                androidx.work.ExistingWorkPolicy.REPLACE,
-                OneTimeWorkRequest.from(DataExporterScheduleWorker::class.java)
-            )
-        }
-    ) {
+    Button(onClick = {
+        workManager.enqueueUniqueWork(
+            WORK_NAME_ONCE,
+            ExistingWorkPolicy.REPLACE,
+            OneTimeWorkRequest.from(DataExporterScheduleWorker::class.java)
+        )
+    }) {
         Text(text = "Run Data Export")
     }
 }
 
-val requiredPermissions = arrayOf(
-    android.Manifest.permission.POST_NOTIFICATIONS,
-)
+val requiredPermissions = arrayOf(android.Manifest.permission.POST_NOTIFICATIONS)
 
 @Composable
 fun RequestPermissionButton() {
     val context = LocalContext.current
     val isPermissionGranted = ActivityCompat.checkSelfPermission(
-        context as MainActivity, android.Manifest.permission.POST_NOTIFICATIONS
-    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        context as MainActivity,
+        android.Manifest.permission.POST_NOTIFICATIONS
+    ) == PackageManager.PERMISSION_GRANTED
 
     Button(
         enabled = !isPermissionGranted,
         onClick = {
-            Log.d("MainActivity", "RequestPermissionButton is Pressed")
-            ActivityCompat.requestPermissions(
-                context,
-                requiredPermissions,
-                1,
-            )
+            ActivityCompat.requestPermissions(context, requiredPermissions, 1)
         },
     ) {
         Text(text = "Notification Permission")
@@ -216,21 +203,12 @@ fun RequestPermissionButton() {
 
 @Composable
 fun RequestHealthConnectPermissionButton() {
-    var isButtonEnabled = true
-
-    val context = LocalContext.current
-    val healthConnect = HealthConnectClient.getOrCreate(context)
     val permissionLauncher =
         rememberLauncherForActivityResult(PermissionController.createRequestPermissionResultContract()) { granted ->
             Log.d("MainActivity", "Health Connect granted permissions: $granted")
         }
 
-    Button(
-        enabled = isButtonEnabled,
-        onClick = {
-            permissionLauncher.launch(requiredHealthConnectPermissions)
-        },
-    ) {
+    Button(onClick = { permissionLauncher.launch(requiredHealthConnectPermissions) }) {
         Text(text = "Health Connect Permission")
     }
 }

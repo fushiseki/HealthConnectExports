@@ -6,7 +6,6 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.ExistingPeriodicWorkPolicy
-import androidx.work.NetworkType
 import androidx.work.PeriodicWorkRequest
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
@@ -15,18 +14,17 @@ import xyz.angeloanan.healthconnectexports.DataExporterScheduleWorker
 import java.time.Duration
 import java.util.concurrent.TimeUnit
 
-const val WORK_NAME = "HealthConnectDailyExporter"
+const val WORK_NAME = "HealthConnectWeeklyExporter"
 const val WORK_NAME_ONCE = "HealthConnectExporter"
 
 val dataExportRequest: PeriodicWorkRequest =
     PeriodicWorkRequestBuilder<DataExporterScheduleWorker>(
-        repeatInterval = 24, repeatIntervalTimeUnit = TimeUnit.HOURS,
-        flexTimeInterval = 12, flexTimeIntervalUnit = TimeUnit.HOURS
+        repeatInterval = 7,
+        repeatIntervalTimeUnit = TimeUnit.DAYS,
     )
         .setConstraints(
             Constraints.Builder()
                 .setRequiresBatteryNotLow(true)
-                .setRequiredNetworkType(NetworkType.CONNECTED)
                 .build()
         )
         .setBackoffCriteria(
@@ -35,18 +33,24 @@ val dataExportRequest: PeriodicWorkRequest =
         )
         .build()
 
-
 class ExporterBackgroundWorkViewModel(application: Application) : AndroidViewModel(application) {
-    val workManager = WorkManager.getInstance(application)
+    private val workManager = WorkManager.getInstance(application)
 
     suspend fun isWorkScheduled(): Boolean {
         val workQuery = workManager.getWorkInfosForUniqueWork(WORK_NAME).await()
-        Log.d("ExporterBackgroundWorkViewModel", "Time until next work: ${workQuery.firstOrNull()?.nextScheduleTimeMillis}")
-        return workQuery.size > 0
+        Log.d(
+            "ExporterBackgroundWorkViewModel",
+            "Time until next work: ${workQuery.firstOrNull()?.nextScheduleTimeMillis}"
+        )
+        return workQuery.isNotEmpty()
     }
 
     fun scheduleWork() {
-        workManager.enqueueUniquePeriodicWork(WORK_NAME, ExistingPeriodicWorkPolicy.UPDATE, dataExportRequest)
+        workManager.enqueueUniquePeriodicWork(
+            WORK_NAME,
+            ExistingPeriodicWorkPolicy.KEEP,
+            dataExportRequest
+        )
         Log.d("ExporterBackgroundWorkViewModel", "Scheduled work")
     }
 
