@@ -10,17 +10,19 @@ import androidx.core.content.getSystemService
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.ActiveCaloriesBurnedRecord
+import androidx.health.connect.client.records.ExerciseSessionRecord
 import androidx.health.connect.client.records.HeartRateRecord
 import androidx.health.connect.client.records.SleepSessionRecord
 import androidx.health.connect.client.records.StepsRecord
 import androidx.health.connect.client.records.TotalCaloriesBurnedRecord
 import androidx.health.connect.client.records.WeightRecord
-import androidx.health.connect.client.request.AggregateRequest
+import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import com.google.gson.Gson
 import java.time.Instant
+import java.time.ZoneOffset
 
 val requiredHealthConnectPermissions = setOf(
     HealthPermission.getReadPermission(StepsRecord::class),
@@ -29,6 +31,7 @@ val requiredHealthConnectPermissions = setOf(
     HealthPermission.getReadPermission(TotalCaloriesBurnedRecord::class),
     HealthPermission.getReadPermission(HeartRateRecord::class),
     HealthPermission.getReadPermission(WeightRecord::class),
+    HealthPermission.getReadPermission(ExerciseSessionRecord::class),
 )
 
 class DataExporterScheduleWorker(
@@ -37,6 +40,20 @@ class DataExporterScheduleWorker(
 ) : CoroutineWorker(appContext, workerParams) {
     private val notificationManager = applicationContext.getSystemService<NotificationManager>()!!
     private val healthConnect = HealthConnectClient.getOrCreate(applicationContext)
+
+    private fun sleepStageName(stage: Int): String {
+        return when (stage) {
+            SleepSessionRecord.STAGE_TYPE_AWAKE -> "AWAKE"
+            SleepSessionRecord.STAGE_TYPE_SLEEPING -> "SLEEPING"
+            SleepSessionRecord.STAGE_TYPE_OUT_OF_BED -> "OUT_OF_BED"
+            SleepSessionRecord.STAGE_TYPE_LIGHT -> "LIGHT"
+            SleepSessionRecord.STAGE_TYPE_DEEP -> "DEEP"
+            SleepSessionRecord.STAGE_TYPE_REM -> "REM"
+            SleepSessionRecord.STAGE_TYPE_AWAKE_IN_BED -> "AWAKE_IN_BED"
+            SleepSessionRecord.STAGE_TYPE_UNKNOWN -> "UNKNOWN"
+            else -> "UNRECOGNIZED"
+        }
+    }
 
     private fun createNotificationChannel(): NotificationChannel {
         val notificationChannel = NotificationChannel(
@@ -94,40 +111,126 @@ class DataExporterScheduleWorker(
 
         val exportTo = Instant.now()
         val lastExportTimestamp = prefs.getLong(LAST_EXPORT_TIMESTAMP_KEY, -1)
+        Log.d(
+            "DataExporterWorker",
+            "Loaded last_export_timestamp=$lastExportTimestamp (raw=${prefs.all[LAST_EXPORT_TIMESTAMP_KEY]})"
+        )
         val exportFrom = if (lastExportTimestamp > 0) {
             Instant.ofEpochMilli(lastExportTimestamp)
         } else {
             Instant.EPOCH
         }
+        Log.d("DataExporterWorker", "Export range from=$exportFrom to=$exportTo")
 
         return try {
-            val healthDataAggregate = healthConnect.aggregate(
-                AggregateRequest(
-                    metrics = setOf(
-                        StepsRecord.COUNT_TOTAL,
-                        ActiveCaloriesBurnedRecord.ACTIVE_CALORIES_TOTAL,
-                        TotalCaloriesBurnedRecord.ENERGY_TOTAL,
-                        SleepSessionRecord.SLEEP_DURATION_TOTAL,
-                    ),
-                    timeRangeFilter = TimeRangeFilter.between(exportFrom, exportTo),
-                )
-            )
+            val timeFilter = TimeRangeFilter.between(exportFrom, exportTo)
 
-            val jsonValues = HashMap<String, Number>()
-            jsonValues["steps"] = healthDataAggregate[StepsRecord.COUNT_TOTAL] ?: 0
-            jsonValues["active_calories"] =
-                healthDataAggregate[ActiveCaloriesBurnedRecord.ACTIVE_CALORIES_TOTAL]?.inKilocalories
-                    ?: 0
-            jsonValues["total_calories"] =
-                healthDataAggregate[TotalCaloriesBurnedRecord.ENERGY_TOTAL]?.inKilocalories ?: 0
-            jsonValues["sleep_duration_seconds"] =
-                healthDataAggregate[SleepSessionRecord.SLEEP_DURATION_TOTAL]?.seconds ?: 0
+            val steps = healthConnect.readRecords(
+                ReadRecordsRequest(
+                    recordType = StepsRecord::class,
+                    timeRangeFilter = timeFilter,
+                )
+            ).records.map {
+                mapOf(
+                    "start" to it.startTime.atOffset(ZoneOffset.UTC).toString(),
+                    "end" to it.endTime.atOffset(ZoneOffset.UTC).toString(),
+                    "count" to it.count,
+                )
+            }
+
+            val activeCalories = healthConnect.readRecords(
+                ReadRecordsRequest(
+                    recordType = ActiveCaloriesBurnedRecord::class,
+                    timeRangeFilter = timeFilter,
+                )
+            ).records.map {
+                mapOf(
+                    "start" to it.startTime.atOffset(ZoneOffset.UTC).toString(),
+                    "end" to it.endTime.atOffset(ZoneOffset.UTC).toString(),
+                    "kilocalories" to it.energy.inKilocalories,
+                )
+            }
+
+            val totalCalories = healthConnect.readRecords(
+                ReadRecordsRequest(
+                    recordType = TotalCaloriesBurnedRecord::class,
+                    timeRangeFilter = timeFilter,
+                )
+            ).records.map {
+                mapOf(
+                    "start" to it.startTime.atOffset(ZoneOffset.UTC).toString(),
+                    "end" to it.endTime.atOffset(ZoneOffset.UTC).toString(),
+                    "kilocalories" to it.energy.inKilocalories,
+                )
+            }
+
+            val heartRate = healthConnect.readRecords(
+                ReadRecordsRequest(
+                    recordType = HeartRateRecord::class,
+                    timeRangeFilter = timeFilter,
+                )
+            ).records.flatMap { record ->
+                record.samples.map { sample ->
+                    mapOf(
+                        "time" to sample.time.atOffset(ZoneOffset.UTC).toString(),
+                        "bpm" to sample.beatsPerMinute,
+                    )
+                }
+            }
+
+            val sleep = healthConnect.readRecords(
+                ReadRecordsRequest(
+                    recordType = SleepSessionRecord::class,
+                    timeRangeFilter = timeFilter,
+                )
+            ).records.flatMap { record ->
+                record.stages.map { stage ->
+                    mapOf(
+                        "start" to stage.startTime.atOffset(ZoneOffset.UTC).toString(),
+                        "end" to stage.endTime.atOffset(ZoneOffset.UTC).toString(),
+                        "stage" to sleepStageName(stage.stage),
+                    )
+                }
+            }
+
+            val weight = healthConnect.readRecords(
+                ReadRecordsRequest(
+                    recordType = WeightRecord::class,
+                    timeRangeFilter = timeFilter,
+                )
+            ).records.map {
+                mapOf(
+                    "time" to it.time.atOffset(ZoneOffset.UTC).toString(),
+                    "kilograms" to it.weight.inKilograms,
+                )
+            }
+
+            val exercise = healthConnect.readRecords(
+                ReadRecordsRequest(
+                    recordType = ExerciseSessionRecord::class,
+                    timeRangeFilter = timeFilter,
+                )
+            ).records.map {
+                mapOf(
+                    "start" to it.startTime.atOffset(ZoneOffset.UTC).toString(),
+                    "end" to it.endTime.atOffset(ZoneOffset.UTC).toString(),
+                    "exercise_type" to it.exerciseType,
+                    "title" to it.title,
+                    "notes" to it.notes,
+                )
+            }
 
             val json = Gson().toJson(
                 mapOf(
                     "from" to exportFrom.toEpochMilli(),
                     "to" to exportTo.toEpochMilli(),
-                    "data" to jsonValues,
+                    "steps" to steps,
+                    "active_calories" to activeCalories,
+                    "total_calories" to totalCalories,
+                    "heart_rate" to heartRate,
+                    "sleep" to sleep,
+                    "weight" to weight,
+                    "exercise" to exercise,
                 )
             )
             val fileName = buildExportFilename(exportFrom, exportTo)
@@ -138,7 +241,12 @@ class DataExporterScheduleWorker(
                 return Result.failure()
             }
 
-            prefs.edit().putLong(LAST_EXPORT_TIMESTAMP_KEY, exportTo.toEpochMilli()).apply()
+            val saved = prefs.edit().putLong(LAST_EXPORT_TIMESTAMP_KEY, exportTo.toEpochMilli()).commit()
+            val verifiedTimestamp = prefs.getLong(LAST_EXPORT_TIMESTAMP_KEY, -1)
+            Log.d(
+                "DataExporterWorker",
+                "Saved last_export_timestamp=${exportTo.toEpochMilli()} success=$saved verified=$verifiedTimestamp"
+            )
             Result.success()
         } catch (e: Exception) {
             Log.e("DataExporterWorker", "Failed to export data", e)
