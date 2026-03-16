@@ -100,7 +100,9 @@ class MainActivity : ComponentActivity() {
 fun ExportFolderSection() {
     val context = LocalContext.current
     val prefs = remember { context.exportPrefs() }
-    var folderUriString by remember { mutableStateOf(prefs.getString(EXPORT_FOLDER_URI_KEY, null)) }
+    var folderUriString: String? by remember {
+        mutableStateOf(prefs.getString(EXPORT_FOLDER_URI_KEY, null))
+    }
     val folderLabel = folderUriString ?: "No folder selected"
 
     val folderPickerLauncher = rememberLauncherForActivityResult(
